@@ -4,16 +4,17 @@ import numpy as np
 import cv2
 import os
 import time
+import av  # Penting untuk pengolahan video modern
 from ultralytics import YOLO
-from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, RTCConfiguration
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
 from streamlit_js_eval import streamlit_js_eval
 
-
 # ===============================
-# 1. KONFIGURASI HALAMAN
+# 1. KONFIGURASI HALAMAN & CSS
 # ===============================
 st.set_page_config(page_title="Jeruk Siam AI", page_icon="🍊", layout="wide")
 
+# CSS Original Anda + Perbaikan tampilan video
 st.markdown("""
 <style>
 [data-testid="stSidebar"] { display: none; }
@@ -40,37 +41,32 @@ video { width: 100% !important; height: auto !important; border-radius: 12px; bo
 </style>
 """, unsafe_allow_html=True)
 
-
 # ===============================
 # 2. DETEKSI DEVICE
 # ===============================
 screen_width = streamlit_js_eval(js_expressions='window.innerWidth', key='WIDTH')
 is_mobile = screen_width is not None and screen_width < 768
 
-
 # ===============================
-# 3. LOAD MODEL
+# 3. LOAD MODEL (Cached)
 # ===============================
 @st.cache_resource
 def load_models():
     keras_path = "model_jeruk_rgb_final.keras"
-
-    detector = YOLO("yolov8n.pt")
-
+    # Menggunakan yolov8n (nano) agar ringan di server Cloud
+    detector = YOLO("yolov8n.pt") 
+    
     if os.path.exists(keras_path):
         classifier = tf.keras.models.load_model(keras_path)
     else:
-        st.error(f"File {keras_path} tidak ditemukan.")
+        st.error(f"File {keras_path} tidak ditemukan di direktori.")
         classifier = None
-
     return detector, classifier
-
 
 detector, classifier = load_models()
 
-
 # ===============================
-# 4. UI
+# 4. UI HEADER & PANDUAN
 # ===============================
 st.title("🍊 Deteksi & Klasifikasi Kualitas Jeruk Siam")
 
@@ -78,20 +74,19 @@ st.markdown("""
 <div class="instruction-box">
 <h4>Panduan Penggunaan</h4>
 <ol>
-<li>Tekan START untuk mengaktifkan kamera.</li>
-<li>Dekatkan jeruk (15–30 cm).</li>
-<li>Pastikan pencahayaan terang.</li>
-<li>Tahan posisi sampai hasil terkunci.</li>
+<li>Tekan <b>START</b> untuk mengaktifkan kamera.</li>
+<li>Dekatkan jeruk ke arah kamera (jarak 15–30 cm).</li>
+<li>Pastikan pencahayaan ruangan terang agar warna kulit terdeteksi akurat.</li>
+<li>Tahan posisi beberapa detik sampai hasil analisis muncul.</li>
 </ol>
-<div class="tech-tag">YOLOv8 + MobileNetV2</div>
+<div class="tech-tag">Powered by: YOLOv8 (Detection) + MobileNetV2 (Classification)</div>
 </div>
 """, unsafe_allow_html=True)
 
-
 # ===============================
-# 5. VIDEO PROCESSOR
+# 5. VIDEO PROCESSOR (The Engine)
 # ===============================
-class OrangeAnalyzer(VideoTransformerBase):
+class OrangeAnalyzer(VideoProcessorBase):
     def __init__(self):
         self.detector = detector
         self.classifier = classifier
@@ -99,113 +94,96 @@ class OrangeAnalyzer(VideoTransformerBase):
         self.frame_count = 0
         self.threshold = 0.5
 
-    def transform(self, frame):
+    def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
         self.frame_count += 1
 
-        if self.frame_count % 7 != 0:
-            return img
+        # Analisa dilakukan setiap 5 frame untuk menghemat CPU di Cloud
+        if self.frame_count % 5 != 0:
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
 
         current_time = time.time()
 
-        # Hapus objek lama
+        # Membersihkan objek yang sudah hilang dari kamera (lebih dari 2 detik)
         self.memory = {
             k: v for k, v in self.memory.items()
             if current_time - v["last_seen"] <= 2
         }
 
+        # Jalankan YOLO Tracking (imgsz kecil = lebih cepat)
         results = self.detector.track(
-            img,
-            persist=True,
-            conf=0.5,
-            classes=[47, 49],
-            imgsz=224,
+            img, 
+            persist=True, 
+            conf=0.4, 
+            classes=[47, 49], # Apple/Orange di dataset COCO
+            imgsz=320, 
             verbose=False
         )
 
-        if not results or results[0].boxes.id is None:
-            return img
+        if results and results[0].boxes.id is not None:
+            boxes = results[0].boxes.xyxy.cpu().numpy().astype(int)
+            ids = results[0].boxes.id.cpu().numpy().astype(int)
 
-        boxes = results[0].boxes.xyxy.cpu().numpy().astype(int)
-        ids = results[0].boxes.id.cpu().numpy().astype(int)
+            for box, obj_id in zip(boxes, ids):
+                x1, y1, x2, y2 = box
 
-        for box, obj_id in zip(boxes, ids):
-            x1, y1, x2, y2 = box
+                if obj_id not in self.memory:
+                    self.memory[obj_id] = {
+                        "scores": [],
+                        "decision": None,
+                        "last_seen": current_time
+                    }
 
-            label_text = "Menganalisa..."
-            color = (255, 255, 255)
+                mem = self.memory[obj_id]
+                mem["last_seen"] = current_time
 
-            if obj_id not in self.memory:
-                self.memory[obj_id] = {
-                    "scores": [],
-                    "decision": None,
-                    "last_seen": current_time
-                }
+                # Jika belum ada keputusan final, lakukan klasifikasi MobileNetV2
+                if mem["decision"] is None and self.classifier is not None:
+                    crop = img[max(0,y1):y2, max(0,x1):x2]
 
-            mem = self.memory[obj_id]
-            mem["last_seen"] = current_time
+                    if crop.size > 0:
+                        # Pre-processing sesuai standar training Anda
+                        crop_input = cv2.resize(crop, (224, 224))
+                        crop_input = cv2.cvtColor(crop_input, cv2.COLOR_BGR2RGB)
+                        crop_input = crop_input.astype("float32") / 255.0
+                        crop_input = np.expand_dims(crop_input, axis=0)
 
-            if mem["decision"] is None and self.classifier is not None:
-                crop = img[y1:y2, x1:x2]
+                        pred = self.classifier.predict(crop_input, verbose=0)
+                        score = float(pred[0][0])
+                        mem["scores"].append(score)
 
-                if crop.size > 0:
-                    crop = cv2.resize(crop, (224, 224))
-                    crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-                    crop = crop.astype("float32") / 255.0
-                    crop = np.expand_dims(crop, axis=0)
+                        # Menampilkan progres analisa sementara
+                        progress = int((len(mem["scores"]) / 15) * 100)
+                        label_temp = "MANIS" if score > self.threshold else "ASAM"
+                        color_temp = (0, 255, 0) if score > self.threshold else (0, 0, 255)
+                        
+                        cv2.putText(img, f"{label_temp} ({progress}%)", (x1, y1 - 10), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_temp, 2)
 
-                    pred = self.classifier.predict(crop, verbose=0)
-                    score = float(pred[0][0])
-                    mem["scores"].append(score)
+                        # Jika sudah terkumpul 15 sampel, ambil keputusan rata-rata
+                        if len(mem["scores"]) >= 15:
+                            avg_score = np.mean(mem["scores"])
+                            mem["decision"] = "MANIS" if avg_score > 0.5 else "ASAM"
 
-                    temp_label = "MANIS" if score > self.threshold else "ASAM"
-                    color = (0, 255, 0) if score > self.threshold else (0, 0, 255)
-                    progress = int((len(mem["scores"]) / 15) * 100)
+                # Jika keputusan sudah final, tampilkan label tetap & Confidence
+                elif mem["decision"] is not None:
+                    final_label = mem["decision"]
+                    color = (0, 255, 0) if final_label == "MANIS" else (0, 0, 255)
                     
-                    # Output: MANIS (20%) atau ASAM (20%)
-                    label_text = f"{temp_label} ({progress}%)"
+                    # Hitung persentase keyakinan
+                    avg_score = np.mean(mem["scores"])
+                    conf_val = avg_score if final_label == "MANIS" else (1 - avg_score)
+                    
+                    cv2.rectangle(img, (x1, y1), (x2, y2), color, 3)
+                    cv2.putText(img, final_label, (x1, y1 - 15), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+                    cv2.putText(img, f"Conf: {conf_val*100:.1f}%", (x1, y2 + 25), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-                    if len(mem["scores"]) >= 15:
-                        avg = np.mean(mem["scores"])
-                        mem["decision"] = "MANIS" if avg > 0.12 else "ASAM"
-
-            elif mem["decision"] is not None:
-                label_text = mem["decision"]
-                color = (0, 255, 0) if label_text == "MANIS" else (0, 0, 255)
-                
-                # --- TAMBAHAN: Teks Confidence Score ---
-                # Menghitung % keyakinan dari rata-rata score yang tersimpan
-                avg_score = np.mean(mem["scores"])
-                conf_val = avg_score if label_text == "MANIS" else (1 - avg_score)
-                conf_text = f"Conf: {conf_val*100:.1f}%"
-                
-                # Menampilkan di bawah kiri kotak (y2 + 25)
-                cv2.putText(
-                    img, 
-                    conf_text, 
-                    (x1, y2 + 25), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 
-                    0.6, 
-                    color, 
-                    2
-                )
-
-            # Gambar Box & Label Atas (Tetap sesuai code asli Anda)
-            cv2.rectangle(img, (x1, y1), (x2, y2), color, 3)
-            cv2.putText(
-                img,
-                label_text,
-                (x1, y1 - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                color,
-                2
-            )
-        return img
-
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 # ===============================
-# 6. WEBRTC CONFIG
+# 6. WEBRTC STREAMER LAUNCHER
 # ===============================
 RTC_CONFIGURATION = RTCConfiguration(
     {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
@@ -213,10 +191,14 @@ RTC_CONFIGURATION = RTCConfiguration(
 
 webrtc_streamer(
     key="jeruk-app",
-    video_transformer_factory=OrangeAnalyzer,
+    video_processor_factory=OrangeAnalyzer,
     rtc_configuration=RTC_CONFIGURATION,
     media_stream_constraints={
-        "video": {"facingMode": "environment", "width": {"ideal": 480}},
+        "video": {
+            "facingMode": "environment" if is_mobile else "user",
+            "width": {"ideal": 640},
+            "frameRate": {"ideal": 20}
+        },
         "audio": False
     },
     async_processing=True,
