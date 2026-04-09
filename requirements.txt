@@ -1,7 +1,6 @@
 streamlit
-tensorflow
+tensorflow-cpu
 ultralytics
 streamlit-webrtc
 av
-streamlit-js-eval
 opencv-python-headless
