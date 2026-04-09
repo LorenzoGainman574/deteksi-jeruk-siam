@@ -1,6 +1,0 @@
-streamlit
-tensorflow-cpu
-ultralytics
-streamlit-webrtc
-av
-opencv-python-headless
